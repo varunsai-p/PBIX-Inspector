@@ -962,6 +962,206 @@ def _parse_diagram_layout(obj: dict, result: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PBIP Report folder — filter extraction helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_filter_field(field: dict) -> str:
+    """Convert a filter field dict to a readable 'Table[Column]' string."""
+    col  = field.get("Column", {})
+    hier = field.get("Hierarchy", {})
+    meas = field.get("Measure", {})
+    if col:
+        ent  = (col.get("Expression") or {}).get("SourceRef", {}).get("Entity", "")
+        prop = col.get("Property", "")
+        return f"{ent}[{prop}]" if ent and prop else ""
+    if hier:
+        ent  = (hier.get("Expression") or {}).get("SourceRef", {}).get("Entity", "")
+        h    = hier.get("Hierarchy", "")
+        lv   = hier.get("Level", "")
+        label = f"{h}.{lv}" if lv else h
+        return f"{ent}[{label}]" if ent else ""
+    if meas:
+        ent  = (meas.get("Expression") or {}).get("SourceRef", {}).get("Entity", "")
+        prop = meas.get("Property", "")
+        return f"{ent}[{prop}]" if ent and prop else ""
+    return ""
+
+
+_TIME_UNIT_LABELS = {0: "day", 1: "week", 2: "month", 3: "month", 4: "year", 5: "year"}
+
+
+def _describe_date_add(expr: dict) -> str:
+    """Recursively describe a DateAdd expression as human-readable text."""
+    da = expr.get("DateAdd", {})
+    if not da:
+        return "today" if "Now" in expr else ""
+    amount = da.get("Amount", 0)
+    unit   = _TIME_UNIT_LABELS.get(da.get("TimeUnit", 0), "period")
+    inner  = _describe_date_add(da.get("Expression", {}))
+    if amount == 0:
+        return inner
+    direction = "ago" if amount < 0 else "ahead"
+    return f"{abs(amount)} {unit}(s) {direction}"
+
+
+_COMPARISON_OPS = {0: "=", 1: ">", 2: ">=", 3: "<", 4: "<="}
+
+
+def _clean_literal(val: str) -> str:
+    """Strip Power BI literal formatting: 'Urban' → Urban, 1L → 1, 3.14D → 3.14."""
+    if val == "null": return "null"
+    val = val.strip("\'\"")
+    if val.endswith("L") and val[:-1].lstrip("-").isdigit():
+        return val[:-1]
+    if val.endswith("D") and val[:-1].replace(".", "").lstrip("-").isdigit():
+        return val[:-1]
+    return val
+
+
+def _extract_filter_values(f: dict) -> str:
+    """
+    Extract the active filter value(s) from a single filter dict.
+    Handles: Categorical (In/Not In), Advanced (Comparison/Not Comparison),
+             Or trees, RelativeDate (Between/DateSpan), GreaterThan, LessThan.
+    Returns a human-readable string.
+    """
+    filt = f.get("filter", {})
+    if not filt:
+        return "is All"
+
+    values = []
+
+    def _collect_or_lits(node: dict, acc: list):
+        """Recursively collect literals from an Or-tree."""
+        if not isinstance(node, dict): return
+        for k, v in node.items():
+            if k == "Comparison":
+                right_lit = v.get("Right", {}).get("Literal", {}).get("Value", "")
+                if right_lit: acc.append(_clean_literal(right_lit))
+            elif k == "In":
+                for vg in v.get("Values", []):
+                    for val in vg:
+                        lit = val.get("Literal", {}).get("Value", "")
+                        if lit: acc.append(_clean_literal(lit))
+            elif isinstance(v, dict):
+                _collect_or_lits(v, acc)
+
+    for where in filt.get("Where", []):
+        cond = where.get("Condition", {})
+
+        # Categorical: In (selected values)
+        in_cond = cond.get("In", {})
+        if in_cond:
+            for vg in in_cond.get("Values", []):
+                for v in vg:
+                    lit = v.get("Literal", {}).get("Value", "")
+                    if lit: values.append(_clean_literal(lit))
+
+        # Not condition
+        not_cond = cond.get("Not", {})
+        if not_cond:
+            inner = not_cond.get("Expression", {})
+            in2 = inner.get("In", {})
+            if in2:
+                for vg in in2.get("Values", []):
+                    for v in vg:
+                        lit = v.get("Literal", {}).get("Value", "")
+                        if lit: values.append(f"not {_clean_literal(lit)}")
+            comp2 = inner.get("Comparison", {})
+            if comp2:
+                right_lit = comp2.get("Right", {}).get("Literal", {}).get("Value", "")
+                right_val = _clean_literal(right_lit) if right_lit else ""
+                kind = comp2.get("ComparisonKind", 0)
+                op   = _COMPARISON_OPS.get(kind, "=")
+                if right_val == "null":
+                    values.append("is not blank")
+                else:
+                    values.append(f"not {op} {right_val}")
+
+        # Top-level Comparison (Advanced filter)
+        comp = cond.get("Comparison", {})
+        if comp:
+            kind = comp.get("ComparisonKind", 0)
+            op   = _COMPARISON_OPS.get(kind, "=")
+            right_lit = comp.get("Right", {}).get("Literal", {}).get("Value", "")
+            right_val = _clean_literal(right_lit) if right_lit else ""
+            if right_val == "null":
+                values.append("is blank")
+            elif op == "=":
+                values.append(right_val)
+            else:
+                values.append(f"{op} {right_val}")
+
+        # Or tree
+        or_cond = cond.get("Or", {})
+        if or_cond:
+            acc = []
+            _collect_or_lits(or_cond, acc)
+            if acc: values.extend(acc)
+
+        # Between (RelativeDate)
+        between = cond.get("Between", {})
+        if between:
+            lb = between.get("LowerBound", {})
+            ub = between.get("UpperBound", {})
+            lb_ds = lb.get("DateSpan", {})
+            ub_ds = ub.get("DateSpan", {})
+            if lb_ds and ub_ds:
+                lb_desc = _describe_date_add(lb_ds.get("Expression", {}))
+                ub_desc = _describe_date_add(ub_ds.get("Expression", {}))
+                values.append(f"{lb_desc} to {ub_desc}")
+            else:
+                lb_lit = _clean_literal(lb.get("Literal", {}).get("Value", ""))
+                ub_lit = _clean_literal(ub.get("Literal", {}).get("Value", ""))
+                if lb_lit or ub_lit: values.append(f"{lb_lit} to {ub_lit}")
+
+        # GreaterThan / LessThan / etc.
+        for cond_key, prefix in [("GreaterThan", ">"), ("GreaterEqual", ">="),
+                                   ("LessThan",    "<"), ("LessEqual",    "<=")]:
+            gc = cond.get(cond_key, {})
+            if gc:
+                lit = gc.get("Right", {}).get("Literal", {}).get("Value", "")
+                if lit: values.append(f"{prefix} {_clean_literal(lit)}")
+
+    return ", ".join(values) if values else "is All"
+
+
+def _parse_page_filters(page_jsons: list, report_json: dict = None) -> tuple:
+    """
+    Extract page-level and all-pages filter fields with their active values.
+
+    Returns:
+        all_pages_str    : list of 'Table[Column] = value' strings joined by ' | '
+        page_filter_map  : {displayName -> same format string}
+    """
+    def _filters_to_str(filters: list) -> str:
+        parts = []
+        for f in filters:
+            field_str = _extract_filter_field(f.get("field", {}))
+            if not field_str:
+                continue
+            val_str = _extract_filter_values(f)
+            parts.append(f"{field_str} = {val_str}")
+        return " | ".join(parts)
+
+    all_pages_str = ""
+    page_filter_map = {}
+
+    if report_json:
+        fc = report_json.get("filterConfig", {})
+        all_pages_str = _filters_to_str(fc.get("filters", []))
+
+    for obj in page_jsons:
+        pname = obj.get("displayName", "")
+        if not pname:
+            continue
+        fc = obj.get("filterConfig", {})
+        page_filter_map[pname] = _filters_to_str(fc.get("filters", []))
+
+    return all_pages_str, page_filter_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PBIP Report folder parser — visual.json files
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1037,12 +1237,39 @@ def _parse_visual_json_files(visual_jsons: list, page_jsons: list, result: dict,
                         if prop: discovered_columns[ent].add((prop, "Unknown"))
                         meas_display.append(f"{ent}[{display}]")
 
+        # Extract visual title from visualContainerObjects or objects
+        visual_title = ""
+        for container in [vis.get("visualContainerObjects", {}), vis.get("objects", {})]:
+            entries = container.get("title", [])
+            if not entries: continue
+            props = (entries[0].get("properties", {})
+                     if isinstance(entries, list) and entries else {})
+            text_val = (props.get("text", {})
+                           .get("expr", {})
+                           .get("Literal", {})
+                           .get("Value", ""))
+            if text_val and text_val.strip("'\""):
+                visual_title = text_val.strip("'\"")
+                break
+
+        # Extract visual-level filters from filterConfig
+        visual_filter_parts = []
+        fc = vis_obj.get("filterConfig", {})
+        for flt in fc.get("filters", []):
+            field_str = _extract_filter_field(flt.get("field", {}))
+            val_str   = _extract_filter_values(flt)
+            if field_str:
+                visual_filter_parts.append(f"{field_str} = {val_str}")
+        visual_filters = " | ".join(visual_filter_parts)
+
         visuals.append({
-            "Page":          page_name,
-            "Visual Type":   vtype,
-            "Tables Used":   ", ".join(sorted(all_tables)),
-            "Measures Used": ", ".join(meas_display),
-            "Columns Used":  ", ".join(col_display),
+            "Page":           page_name,
+            "Visual Title":   visual_title,
+            "Visual Type":    vtype,
+            "Visual Filters": visual_filters,
+            "Tables Used":    ", ".join(sorted(all_tables)),
+            "Measures Used":  ", ".join(meas_display),
+            "Columns Used":   ", ".join(col_display),
         })
 
     # Enrich Columns Used on each visual by resolving measure column dependencies
@@ -1945,13 +2172,23 @@ def classify_and_load(files) -> tuple:
                 with _zf.ZipFile(io.BytesIO(fbytes)) as z:
                     znames = z.namelist()
                     # Build page_id → displayName map from page.json files first
-                    _page_id_map = {}
+                    _page_id_map   = {}
+                    _page_filters  = {}   # displayName -> filterConfig obj
+                    _report_json   = {}   # report.json content for all-pages filters
                     for zname in znames:
                         if zname.endswith("page.json") and "/pages/" in zname and "visuals" not in zname:
                             try:
                                 obj = json.loads(z.read(zname).decode("utf-8","replace"))
                                 if "name" in obj and "displayName" in obj:
                                     _page_id_map[obj["name"]] = obj["displayName"]
+                                    # Store full page.json for filter extraction
+                                    _page_filters[obj["displayName"]] = obj
+                            except: pass
+                        # Capture report.json (all-pages filters)
+                        elif (zname.endswith("report.json") and "definition" in zname
+                              and "pages" not in zname):
+                            try:
+                                _report_json = json.loads(z.read(zname).decode("utf-8","replace"))
                             except: pass
 
                     for zname in znames:
@@ -1992,9 +2229,13 @@ def classify_and_load(files) -> tuple:
                             except Exception:
                                 pass
 
-                    # Store the page_id_map so extract_from_classified can pass it through
+                    # Store the page_id_map and filter data for extract_from_classified
                     if _page_id_map and not hasattr(_page_id_map, '_injected'):
-                        page_jsons.append({"_page_id_map": _page_id_map})
+                        page_jsons.append({
+                            "_page_id_map":  _page_id_map,
+                            "_page_filters": _page_filters,
+                            "_report_json":  _report_json,
+                        })
 
             except Exception:
                 pass
@@ -2060,12 +2301,16 @@ def extract_from_classified(tmdl_contents, bim_bytes, pbix_bytes, visual_jsons, 
 
     # ── Report extraction ─────────────────────────────────────────────────────
     if visual_jsons:
-        # Extract page_id_map injected during ZIP parsing
-        page_id_map = {}
+        # Extract page_id_map and filter data injected during ZIP parsing
+        page_id_map   = {}
+        page_filters  = {}   # displayName -> page.json obj (for filters)
+        report_json   = {}   # report.json (for all-pages filters)
         real_page_jsons = []
         for pj in page_jsons:
             if "_page_id_map" in pj:
                 page_id_map.update(pj["_page_id_map"])
+                page_filters.update(pj.get("_page_filters", {}))
+                report_json = pj.get("_report_json", {})
             else:
                 real_page_jsons.append(pj)
 
@@ -2074,6 +2319,13 @@ def extract_from_classified(tmdl_contents, bim_bytes, pbix_bytes, visual_jsons, 
         rep_data["_source"] = f"Report ({len(visual_jsons)} visual.json files)"
         rep_data["parse_log"].append(f"Report: {len(visual_jsons)} visuals, {len(real_page_jsons)} page files, {len(page_id_map)} page IDs mapped")
         _parse_visual_json_files(visual_jsons, real_page_jsons, rep_data, page_id_map=page_id_map)
+
+        # Parse filters and attach to rep_data for use in Visuals tab
+        all_pages_filter, page_filter_map = _parse_page_filters(
+            list(page_filters.values()), report_json
+        )
+        rep_data["_all_pages_filter"] = all_pages_filter
+        rep_data["_page_filter_map"]  = page_filter_map
         rep_data = _finalise(rep_data)
 
     elif pbix_bytes and not sem_data:
@@ -2096,10 +2348,16 @@ def merge_results(sem, rep):
         for s in rep.get("sources",[]):
             if (s["Source Type"],s["Server"]) not in sem_src_keys:
                 merged["sources"].append(s)
-        merged["_source"]   = f"{sem.get('_source','SemanticModel')} + {rep.get('_source','Report')}"
-        merged["parse_log"] = sem.get("parse_log",[]) + rep.get("parse_log",[])
+        merged["_source"]           = f"{sem.get('_source','SemanticModel')} + {rep.get('_source','Report')}"
+        merged["parse_log"]         = sem.get("parse_log",[]) + rep.get("parse_log",[])
+        merged["_all_pages_filter"] = rep.get("_all_pages_filter", "")
+        merged["_page_filter_map"]  = rep.get("_page_filter_map",  {})
         return merged
-    return sem or rep or {}
+    result = sem or rep or {}
+    if rep and not sem:
+        result["_all_pages_filter"] = rep.get("_all_pages_filter", "")
+        result["_page_filter_map"]  = rep.get("_page_filter_map",  {})
+    return result
 
 
 # ── Relationship renderer ─────────────────────────────────────────────────────
@@ -2133,7 +2391,7 @@ st.markdown("""
   </div>
   <div style="display:flex;flex-direction:column;align-items:flex-end;gap:0.5rem">
     <span class="hero-badge">v3.0.0</span>
-    <span style="font-family:var(--mono);font-size:0.68rem;color:var(--text-muted)">ZIP · PBIX · PBIT · BIM · TMDL</span>
+    <span style="font-family:var(--mono);font-size:0.68rem;color:var(--text-muted)">ZIP · PBIP Project Folder</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -2141,9 +2399,9 @@ st.markdown("""
 # ── Single upload ─────────────────────────────────────────────────────────────
 
 uploaded = st.file_uploader(
-    "Upload file",
-    type=["zip", "pbix", "pbit", "bim", "json"],
-    help="Upload a ZIP of your PBIP project folder, a .pbix/.pbit, or a .bim/.json",
+    "Upload ZIP file",
+    type=["zip"],
+    help="Upload a ZIP of your PBIP project folder (containing .SemanticModel and .Report folders)",
     label_visibility="collapsed",
     key="main_uploader",
 )
@@ -2155,56 +2413,28 @@ if uploaded is None:
       <div style="font-size:2.5rem;margin-bottom:0.75rem">📂</div>
       <div style="font-family:var(--sans);font-weight:700;font-size:1.1rem;
                   color:var(--text);margin-bottom:0.5rem">
-        Drop your file here or click to browse
+        Drop your ZIP file here or click to browse
       </div>
       <div style="font-family:var(--mono);font-size:0.72rem;color:var(--text-muted)">
-        .zip &nbsp;·&nbsp; .pbix &nbsp;·&nbsp; .pbit &nbsp;·&nbsp; .bim &nbsp;·&nbsp; .json (XMLA)
+        .zip — PBIP project folder
       </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # What to upload
     st.markdown("""
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1rem">
-
-      <div style="background:var(--surface);border:1px solid rgba(247,201,72,0.4);
-                  border-radius:10px;padding:1.1rem">
-        <div style="font-family:var(--sans);font-weight:700;font-size:0.88rem;
-                    color:var(--accent);margin-bottom:0.5rem">⭐ Best — PBIP Project ZIP</div>
-        <div style="font-family:var(--mono);font-size:0.68rem;color:var(--text-muted);line-height:1.7">
-          Right-click the project folder containing<br>
-          <code style="color:var(--accent)">New dashboard.SemanticModel</code><br>
-          <code style="color:var(--accent)">New dashboard.Report</code><br>
-          → Compress to ZIP → upload<br><br>
-          Gives: full DAX + all columns + visuals
-        </div>
+    <div style="background:var(--surface);border:1px solid rgba(247,201,72,0.4);
+                border-radius:10px;padding:1.2rem;max-width:480px">
+      <div style="font-family:var(--sans);font-weight:700;font-size:0.88rem;
+                  color:var(--accent);margin-bottom:0.6rem">How to create the ZIP</div>
+      <div style="font-family:var(--mono);font-size:0.7rem;color:var(--text-muted);line-height:1.8">
+        1. Find your PBIP project folder — it contains:<br>
+        &nbsp;&nbsp;&nbsp;<code style="color:var(--accent)">YourReport.SemanticModel/</code><br>
+        &nbsp;&nbsp;&nbsp;<code style="color:var(--accent)">YourReport.Report/</code><br>
+        &nbsp;&nbsp;&nbsp;<code style="color:var(--accent)">YourReport.pbip</code><br><br>
+        2. Right-click the <strong style="color:var(--text)">project folder</strong> → Compress to ZIP<br>
+        3. Upload the ZIP here<br><br>
+        Gives: full DAX · all columns · measures · relationships · visuals with titles
       </div>
-
-      <div style="background:var(--surface);border:1px solid rgba(59,130,246,0.4);
-                  border-radius:10px;padding:1.1rem">
-        <div style="font-family:var(--sans);font-weight:700;font-size:0.88rem;
-                    color:#93c5fd;margin-bottom:0.5rem">🖥️ Desktop — PBIX / PBIT</div>
-        <div style="font-family:var(--mono);font-size:0.68rem;color:var(--text-muted);line-height:1.7">
-          Upload a <code style="color:#93c5fd">.pbix</code> or <code style="color:#93c5fd">.pbit</code>
-          saved from Power BI Desktop<br><br>
-          Gives: full DAX + columns + visuals<br><br>
-          <em>Cloud-connected .pbix gives visuals only (no DAX)</em>
-        </div>
-      </div>
-
-      <div style="background:var(--surface);border:1px solid rgba(16,185,129,0.4);
-                  border-radius:10px;padding:1.1rem">
-        <div style="font-family:var(--sans);font-weight:700;font-size:0.88rem;
-                    color:#6ee7b7;margin-bottom:0.5rem">📋 Model Only — BIM / JSON</div>
-        <div style="font-family:var(--mono);font-size:0.68rem;color:var(--text-muted);line-height:1.7">
-          Upload a <code style="color:#6ee7b7">.bim</code> or XMLA
-          <code style="color:#6ee7b7">.json</code> from<br>
-          Tabular Editor or SSMS<br><br>
-          Gives: full DAX + all columns<br>
-          <em>(no visual / report data)</em>
-        </div>
-      </div>
-
     </div>
     """, unsafe_allow_html=True)
     st.stop()
@@ -2517,7 +2747,7 @@ with tab_visuals:
     st.markdown('<p class="section-label">Report Visuals</p>', unsafe_allow_html=True)
     visuals = data.get("visuals",[])
     if not visuals:
-        st.markdown('<div class="empty-state"><span class="empty-icon">🖼</span>No visual data. Upload Report files (right box) or a .pbix.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="empty-state"><span class="empty-icon">🖼</span>No visual data. Upload a ZIP file containing the full PBIP project folder.</div>', unsafe_allow_html=True)
     else:
         vdf = pd.DataFrame(visuals)
         col1, col2 = st.columns([1,2])
@@ -2527,11 +2757,20 @@ with tab_visuals:
             st.dataframe(vc, use_container_width=True, hide_index=True)
         with col2:
             st.markdown('<p class="section-label">Tables per Page</p>', unsafe_allow_html=True)
-            pt = vdf.groupby("Page")["Tables Used"].apply(lambda x: ", ".join(sorted({t.strip() for v in x for t in v.split(",") if t.strip()}))).reset_index()
-            pt.columns=["Page","Tables Used"]
+            pt = vdf.groupby("Page")["Tables Used"].apply(
+                lambda x: ", ".join(sorted({t.strip() for v in x for t in v.split(",") if t.strip()}))
+            ).reset_index()
+            pt.columns = ["Page","Tables Used"]
+
+            # Add filter columns from extracted filter data
+            page_filter_map  = data.get("_page_filter_map",  {})
+            all_pages_filter = data.get("_all_pages_filter", "")
+            pt["Page Filters"]      = pt["Page"].map(lambda p: page_filter_map.get(p, ""))
+            pt["All-Pages Filters"] = all_pages_filter
+
             st.dataframe(pt, use_container_width=True, hide_index=True)
         st.markdown('<p class="section-label" style="margin-top:1.5rem">All Visuals</p>', unsafe_allow_html=True)
-        show = [c for c in ["Page","Visual Type","Tables Used","Measures Used","Columns Used"] if c in vdf.columns]
+        show = [c for c in ["Page","Visual Title","Visual Type","Visual Filters","Tables Used","Measures Used","Columns Used"] if c in vdf.columns]
         st.dataframe(vdf[show], use_container_width=True, hide_index=True, height=400)
 
 
