@@ -491,6 +491,8 @@ def _empty_result() -> dict:
         "tables": [], "columns": [], "measures": [],
         "relationships": [], "sources": [],
         "pages": [], "visuals": [],
+        "power_query_steps": [],
+        "rls_roles": [],
         "errors": [], "parse_log": [],
         "report_type": "unknown",
     }
@@ -654,6 +656,15 @@ def _parse_tmsl(schema: dict, result: dict):
         })
     if mquery_text:
         _scan_mquery_sources("\n".join(mquery_text), result)
+
+    # Extract Power Query steps from raw model partitions
+    pq_steps = extract_power_query_steps(model.get("tables", []))
+    if pq_steps:
+        result.setdefault("power_query_steps", []).extend(pq_steps)
+
+    # Extract RLS roles (from model.roles populated by _parse_tmdl_folder)
+    for role in model.get("roles", []):
+        result["rls_roles"].append(role)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1377,6 +1388,183 @@ def _parse_connections(conn: dict, result: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Power Query (M query) step parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _describe_m_step(name: str, expr: str) -> str:
+    """Generate a human-readable description of a single M query step."""
+    e = expr.strip()
+
+    if re.match(r'Sql\.Database\s*\(', e, re.IGNORECASE):
+        has_q  = '[Query=' in e or '[Query =' in e
+        srv_db = re.search(r'Sql\.Database\s*\(\s*"([^"]*)"\s*,\s*"([^"]*)"', e, re.IGNORECASE)
+        srv    = srv_db.group(1) if srv_db else "?"
+        db     = srv_db.group(2) if srv_db else "?"
+        return f"Connect to SQL Server '{srv}' / '{db}'" + (" with custom SQL query" if has_q else "")
+
+    if re.match(r'GoogleBigQuery\.Database', e, re.IGNORECASE):
+        proj = re.search(r'#"([^"]+)"\s*=\s*Source\{', e)
+        sch  = re.search(r'Name="([^"]+)",Kind="Schema"', e)
+        return ("Connect to Google BigQuery"
+                + (f" · project '{proj.group(1)}'" if proj else "")
+                + (f" · schema '{sch.group(1)}'" if sch else ""))
+
+    if re.match(r'Table\.FromRows\s*\(', e, re.IGNORECASE):
+        return "Load embedded (inline) table data"
+
+    if re.match(r'Excel\.Workbook\s*\(', e, re.IGNORECASE):
+        path = re.search(r'File\.Contents\s*\(\s*"([^"]+)"', e)
+        return "Load Excel workbook" + (f" · '{path.group(1)}'" if path else "")
+
+    if re.match(r'Web\.Contents\s*\(', e, re.IGNORECASE):
+        url = re.search(r'"(https?://[^"]+)"', e)
+        return "Fetch data from web" + (f" · {url.group(1)[:60]}" if url else "")
+
+    if re.match(r'SharePoint\.(Files|Tables|Lists)', e, re.IGNORECASE):
+        return "Connect to SharePoint"
+
+    if 'Table.RenameColumns' in e:
+        pairs   = re.findall(r'\{\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\}', e)
+        renamed = [(a, b) for a, b in pairs if a != b]
+        if not renamed:
+            return f"Confirm column names ({len(pairs)} columns)"
+        sample = ', '.join(f'"{a}" → "{b}"' for a, b in renamed[:3])
+        return f"Rename {len(renamed)} column(s): {sample}" + ('…' if len(renamed) > 3 else '')
+
+    if 'Table.TransformColumnTypes' in e:
+        raw   = re.findall(r'\{\s*"([^"]+)"\s*,\s*([^}]+)\}', e)
+        tmap  = {'type text':'text','type number':'number','type date':'date',
+                 'type datetime':'datetime','type logical':'boolean','type time':'time',
+                 'int64.type':'integer','currency.type':'currency'}
+        cols  = [(n, tmap.get(t.strip().lower(), t.strip())) for n, t in raw]
+        if not cols: return "Set column data types"
+        sample = ', '.join(f'"{n}" ({t})' for n, t in cols[:3])
+        suffix = f' + {len(cols)-3} more' if len(cols) > 3 else ''
+        return f"Set data types · {sample}{suffix}"
+
+    if 'Table.SelectColumns' in e:
+        cols = re.findall(r'"([^"]+)"', e)
+        return "Keep columns: " + ', '.join(cols[:5]) + ('…' if len(cols) > 5 else '')
+
+    if 'Table.RemoveColumns' in e:
+        cols = re.findall(r'"([^"]+)"', e)
+        return "Remove columns: " + ', '.join(cols[:5]) + ('…' if len(cols) > 5 else '')
+
+    if 'Table.SelectRows' in e:
+        cond = re.search(r'each\s+(.{0,80})', e)
+        return "Filter rows" + (f": {cond.group(1).strip()}" if cond else "")
+
+    if 'Table.AddColumn' in e:
+        col = re.search(r'"([^"]+)"', e)
+        return f"Add column '{col.group(1)}'" if col else "Add calculated column"
+
+    if 'Table.SortRows' in e:
+        col = re.search(r'"([^"]+)"', e)
+        return f"Sort rows by '{col.group(1)}'" if col else "Sort rows"
+
+    if 'Table.Group' in e:
+        col = re.search(r'"([^"]+)"', e)
+        return f"Group by '{col.group(1)}'" if col else "Group rows"
+
+    if 'Table.Pivot' in e:    return "Pivot column"
+    if 'Table.Unpivot' in e:  return "Unpivot columns"
+    if 'Table.ExpandTableColumn' in e or 'Table.ExpandRecordColumn' in e:
+        col = re.search(r'"([^"]+)"', e)
+        return f"Expand column '{col.group(1)}'" if col else "Expand nested column"
+    if 'Table.TransformColumns' in e:
+        cols = re.findall(r'"([^"]+)"', e)
+        return "Transform columns: " + ', '.join(cols[:3]) + ('…' if len(cols) > 3 else '')
+    if 'Table.PromoteHeaders' in e: return "Use first row as column headers"
+    if 'Table.Distinct' in e:       return "Remove duplicate rows"
+    if 'Table.FillDown' in e:       return "Fill down (replace nulls with previous value)"
+    if 'Table.FillUp' in e:         return "Fill up (replace nulls with next value)"
+    if 'Table.ReplaceValue' in e:   return "Replace values"
+    if 'Table.Combine' in e:        return "Combine (append) tables"
+    if 'Table.NestedJoin' in e or 'Table.Join' in e: return "Merge / join with another table"
+    if 'Table.SplitColumn' in e:
+        col = re.search(r'"([^"]+)"', e)
+        return f"Split column '{col.group(1)}'" if col else "Split column"
+    if 'Table.MergeColumns' in e:
+        cols = re.findall(r'"([^"]+)"', e)
+        return "Merge columns: " + ', '.join(cols[:3])
+    if 'Table.FirstN' in e or 'Table.LastN' in e:
+        n = re.search(r',\s*(\d+)', e)
+        which = "first" if 'FirstN' in e else "last"
+        return f"Keep {which} {n.group(1) if n else 'N'} rows"
+
+    return e[:100] + ('…' if len(e) > 100 else '')
+
+
+def _parse_m_steps(m_expr: str, table_name: str) -> list:
+    """
+    Parse a Power Query M expression into a list of named steps.
+    Each step dict: {Table, Step Order, Step Name, Step Description, Step Expression}
+    """
+    m_expr = m_expr.replace('\r\n', '\n').replace('\r', '\n')
+    let_match = re.search(r'\blet\b(.*?)\bin\b\s*(\S[^\n]*)\s*$', m_expr, re.DOTALL | re.IGNORECASE)
+
+    if not let_match:
+        return [{"Table": table_name, "Step Order": 1, "Step Name": "Expression",
+                 "Step Description": _describe_m_step("Expression", m_expr.strip()),
+                 "Step Expression":  m_expr.strip()}]
+
+    let_body = let_match.group(1)
+    # Split steps on commas at depth 0
+    raw_steps, current, depth = [], [], 0
+    for char in let_body:
+        if char in '([{':   depth += 1
+        elif char in ')]}': depth -= 1
+        if char == ',' and depth == 0:
+            raw_steps.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if current:
+        raw_steps.append(''.join(current).strip())
+
+    result, order = [], 0
+    for step in raw_steps:
+        step = step.strip()
+        if not step: continue
+        nm = (re.match(r'^#?"([^"]+)"\s*=\s*(.*)', step, re.DOTALL) or
+              re.match(r'^([A-Za-z_]\w*)\s*=\s*(.*)', step, re.DOTALL))
+        if not nm: continue
+        sname = nm.group(1).strip()
+        sexpr = nm.group(2).strip()
+        order += 1
+        result.append({
+            "Table":            table_name,
+            "Step Order":       order,
+            "Step Name":        sname,
+            "Step Description": _describe_m_step(sname, sexpr),
+            "Step Expression":  sexpr,
+        })
+    return result
+
+
+def extract_power_query_steps(tables: list) -> list:
+    """
+    Extract Power Query steps from the model tables list (already parsed by _parse_tmsl).
+    tables: list of dicts as stored in result["tables"] — but we need raw partition expressions.
+    Call this on the raw model dict from _parse_tmdl_folder or _parse_tmsl.
+    """
+    # This is called with the model dict tables (pre-finalise), which still have partitions.
+    # The engine stores partitions inside the raw model before _parse_tmsl strips them.
+    # We re-extract from the model dict passed in.
+    skip = {"DateTableTemplate", "LocalDateTable"}
+    steps = []
+    for tbl in tables:
+        tname = tbl.get("name", "")
+        if any(sk in tname for sk in skip): continue
+        for part in tbl.get("partitions", []):
+            expr = (part.get("source", {}) or {}).get("expression", "")
+            if isinstance(expr, list): expr = "\n".join(expr)
+            if expr:
+                steps.extend(_parse_m_steps(expr, tname))
+    return steps
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TMDL folder parser
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1400,6 +1588,9 @@ def _parse_tmdl_folder(files: dict) -> dict:
         # Data sources
         if "datasource" in fname_lower.replace(" ","") or "datasource" in content.lower()[:200]:
             model["dataSources"].extend(_parse_tmdl_datasources(content))
+        # RLS roles (files in roles/ folder or containing 'role ' keyword)
+        if re.match(r'^role\s+', content.strip(), re.IGNORECASE) or "roles/" in fname.replace("\\","/"):
+            model.setdefault("roles", []).extend(_parse_tmdl_roles(content))
 
     return model
 
@@ -1523,6 +1714,62 @@ def _parse_tmdl_table(content: str) -> dict:
     if not table_name:
         return {}
     return {"name": table_name, "columns": columns, "measures": measures, "partitions": partitions}
+
+
+def _parse_tmdl_roles(content: str) -> list:
+    """
+    Parse a TMDL roles file into structured RLS role dicts.
+    Handles:
+      role RoleName
+        modelPermission: read
+        tablePermission TableName = DAX expression
+        member 'user@domain.com'
+    Returns list of role dicts.
+    """
+    roles = []
+    current_role = None
+
+    for line in content.split('\n'):
+        s = line.strip().rstrip('\r')
+        if not s or s.startswith('annotation'): continue
+
+        # New role declaration
+        m = re.match(r'^role\s+(.+)$', s)
+        if m:
+            if current_role: roles.append(current_role)
+            current_role = {
+                "Role Name":        m.group(1).strip("'\""),
+                "Model Permission": "read",
+                "Table Permissions": [],
+                "Members":          [],
+            }
+            continue
+
+        if current_role is None: continue
+
+        # modelPermission: read | readWrite | none
+        m = re.match(r'^modelPermission:\s*(.+)$', s)
+        if m:
+            current_role["Model Permission"] = m.group(1).strip()
+            continue
+
+        # tablePermission TableName = DAX filter expression
+        m = re.match(r"^tablePermission\s+'?([^'=\n]+?)'?\s*=\s*(.+)$", s)
+        if m:
+            current_role["Table Permissions"].append({
+                "Table":             m.group(1).strip(),
+                "Filter Expression": m.group(2).strip(),
+            })
+            continue
+
+        # member 'user@domain.com' or member "group name"
+        m = re.match(r"^member\s+['\"]?(.+?)['\"]?\s*$", s, re.IGNORECASE)
+        if m:
+            current_role["Members"].append(m.group(1).strip())
+            continue
+
+    if current_role: roles.append(current_role)
+    return roles
 
 
 def _parse_tmdl_relationships(content: str) -> list:
@@ -2042,6 +2289,22 @@ def to_excel(data: dict) -> bytes:
         _df(data["sources"]).to_excel(writer,        sheet_name="Data Sources",  index=False)
         if data.get("visuals"):
             _df(data["visuals"]).to_excel(writer,    sheet_name="Visuals",       index=False)
+        if data.get("power_query_steps"):
+            pq_export = pd.DataFrame(data["power_query_steps"])
+            keep = [c for c in ["Table","Step Order","Step Name","Step Description","Step Expression"] if c in pq_export.columns]
+            pq_export[keep].to_excel(writer,         sheet_name="Power Query",   index=False)
+        if data.get("rls_roles"):
+            flat_rls = [
+                {"Role Name": r["Role Name"],
+                 "Model Permission": r["Model Permission"],
+                 "Table": tp["Table"],
+                 "Filter Expression": tp["Filter Expression"]}
+                for r in data["rls_roles"]
+                for tp in r.get("Table Permissions", [])
+            ] or [{"Role Name": r["Role Name"], "Model Permission": r["Model Permission"],
+                   "Table": "", "Filter Expression": ""}
+                  for r in data["rls_roles"]]
+            pd.DataFrame(flat_rls).to_excel(writer,  sheet_name="RLS",           index=False)
     return buf.getvalue()
 
 def to_json(data: dict) -> str:
@@ -2352,6 +2615,8 @@ def merge_results(sem, rep):
         merged["parse_log"]         = sem.get("parse_log",[]) + rep.get("parse_log",[])
         merged["_all_pages_filter"] = rep.get("_all_pages_filter", "")
         merged["_page_filter_map"]  = rep.get("_page_filter_map",  {})
+        merged["power_query_steps"] = sem.get("power_query_steps", []) or rep.get("power_query_steps", [])
+        merged["rls_roles"]         = sem.get("rls_roles", [])         or rep.get("rls_roles", [])
         return merged
     result = sem or rep or {}
     if rep and not sem:
@@ -2526,9 +2791,10 @@ st.markdown(f"""
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 (tab_overview, tab_tables, tab_columns, tab_measures,
- tab_deps, tab_rels, tab_sources, tab_visuals, tab_export) = st.tabs([
+ tab_deps, tab_rels, tab_sources, tab_visuals, tab_pq, tab_rls, tab_export) = st.tabs([
     "📊 Overview", "🗂 Tables", "🔢 Columns", "📐 Measures",
-    "🔍 Dependencies", "🔗 Relationships", "🔌 Data Sources", "🖼 Visuals", "⬇️ Export",
+    "🔍 Dependencies", "🔗 Relationships", "🔌 Data Sources", "🖼 Visuals",
+    "⚡ Power Query", "🔐 RLS", "⬇️ Export",
 ])
 
 
@@ -2775,7 +3041,178 @@ with tab_visuals:
 
 
 # ─────────────────────────────────────────────
-# Tab 9 — Export
+# Tab 9 — Power Query
+# ─────────────────────────────────────────────
+with tab_pq:
+    st.markdown('<p class="section-label">Power Query Steps</p>', unsafe_allow_html=True)
+
+    pq_steps = data.get("power_query_steps", [])
+
+    if not pq_steps:
+        st.markdown(
+            '<div class="empty-state"><span class="empty-icon">⚡</span>'
+            'No Power Query steps found. Upload a PBIP project ZIP with SemanticModel TMDL files.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        pqdf = pd.DataFrame(pq_steps)
+
+        # ── Filter by table ───────────────────────────────────────────────────
+        table_options = ["All"] + sorted(pqdf["Table"].unique().tolist())
+        selected_table = st.selectbox(
+            "Filter by table",
+            table_options,
+            key="pq_table_filter",
+        )
+
+        if selected_table != "All":
+            pqdf_view = pqdf[pqdf["Table"] == selected_table].reset_index(drop=True)
+        else:
+            pqdf_view = pqdf.reset_index(drop=True)
+
+        # ── Summary badges ────────────────────────────────────────────────────
+        step_counts = pqdf.groupby("Table")["Step Name"].count()
+        badges_html = "".join(
+            f'<span style="background:var(--surface2);border:1px solid var(--border);'
+            f'border-radius:20px;padding:0.2rem 0.75rem;font-family:var(--mono);'
+            f'font-size:0.7rem;color:var(--text-muted);margin-right:0.4rem;display:inline-block;margin-bottom:0.3rem">'
+            f'<span style="color:var(--text)">{t}</span> · {c} step{"s" if c != 1 else ""}</span>'
+            for t, c in step_counts.items()
+        )
+        st.markdown(f'<div style="margin-bottom:1rem">{badges_html}</div>', unsafe_allow_html=True)
+
+        # ── Steps table ───────────────────────────────────────────────────────
+        show_cols = [c for c in ["Table","Step Order","Step Name","Step Description"] if c in pqdf_view.columns]
+        st.dataframe(
+            pqdf_view[show_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=min(60 + len(pqdf_view) * 35, 600),
+        )
+
+        # ── Step expression expander per table ────────────────────────────────
+        if selected_table != "All":
+            st.markdown('<p class="section-label" style="margin-top:1.5rem">Step Expressions</p>',
+                        unsafe_allow_html=True)
+            for _, row in pqdf_view.iterrows():
+                with st.expander(f"**{row['Step Name']}** — {row['Step Description'][:60]}"):
+                    st.code(row.get("Step Expression", ""), language="plaintext")
+
+
+# ─────────────────────────────────────────────
+# Tab 10 — RLS
+# ─────────────────────────────────────────────
+with tab_rls:
+    st.markdown('<p class="section-label">Row-Level Security (RLS)</p>', unsafe_allow_html=True)
+
+    rls_roles = data.get("rls_roles", [])
+
+    if not rls_roles:
+        # No RLS configured
+        st.markdown("""
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;
+                    padding:2rem;text-align:center;margin-top:0.5rem">
+          <div style="font-size:2rem;margin-bottom:0.75rem">🔓</div>
+          <div style="font-family:var(--sans);font-weight:700;font-size:1rem;
+                      color:var(--text);margin-bottom:0.4rem">No RLS Configured</div>
+          <div style="font-family:var(--mono);font-size:0.72rem;color:var(--text-muted)">
+            No Row-Level Security roles are defined in this semantic model.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        # Summary bar
+        n_roles = len(rls_roles)
+        n_perms = sum(len(r.get("Table Permissions", [])) for r in rls_roles)
+        n_members = sum(len(r.get("Members", [])) for r in rls_roles)
+        st.markdown(f"""
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-bottom:1.5rem">
+          <div class="metric-card green">
+            <div class="metric-label">Roles</div>
+            <div class="metric-value">{n_roles}</div>
+          </div>
+          <div class="metric-card yellow">
+            <div class="metric-label">Table Filters</div>
+            <div class="metric-value">{n_perms}</div>
+          </div>
+          <div class="metric-card blue">
+            <div class="metric-label">Members Assigned</div>
+            <div class="metric-value">{n_members if n_members else "—"}</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # One card per role
+        for role in rls_roles:
+            rname  = role.get("Role Name", "Unnamed")
+            perm   = role.get("Model Permission", "read")
+            tperms = role.get("Table Permissions", [])
+            members = role.get("Members", [])
+
+            perm_color = {
+                "read":      "#10b981",
+                "readwrite": "#f59e0b",
+                "none":      "#6b7280",
+            }.get(perm.lower().replace(" ",""), "#10b981")
+
+            st.markdown(f"""
+            <div style="background:var(--surface);border:1px solid var(--border);
+                        border-radius:10px;padding:1.2rem;margin-bottom:1rem">
+              <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.9rem">
+                <div style="font-size:1.1rem">🔐</div>
+                <div style="font-family:var(--sans);font-weight:700;font-size:1rem;
+                            color:var(--text)">{rname}</div>
+                <span style="font-family:var(--mono);font-size:0.68rem;
+                             background:rgba(16,185,129,0.1);color:{perm_color};
+                             border:1px solid {perm_color};border-radius:20px;
+                             padding:0.15rem 0.6rem">{perm}</span>
+              </div>
+            """, unsafe_allow_html=True)
+
+            if tperms:
+                st.markdown('<p class="section-label" style="margin:0 0 0.5rem">Table Filters</p>',
+                            unsafe_allow_html=True)
+                tp_df = pd.DataFrame(tperms)
+                st.dataframe(tp_df, use_container_width=True, hide_index=True)
+            else:
+                st.markdown(
+                    '<div style="font-family:var(--mono);font-size:0.72rem;'
+                    'color:var(--text-muted);padding:0.5rem 0">'
+                    'No table-level filters — role grants access to all rows.</div>',
+                    unsafe_allow_html=True,
+                )
+
+            if members:
+                st.markdown('<p class="section-label" style="margin:0.75rem 0 0.4rem">Members</p>',
+                            unsafe_allow_html=True)
+                for mem in members:
+                    st.markdown(
+                        f'<span style="font-family:var(--mono);font-size:0.72rem;'
+                        f'background:var(--surface2);border:1px solid var(--border);'
+                        f'border-radius:4px;padding:0.2rem 0.6rem;margin-right:0.4rem;'
+                        f'color:var(--text-muted)">{mem}</span>',
+                        unsafe_allow_html=True,
+                    )
+
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # Flat table view of all permissions
+        if n_perms:
+            st.markdown('<p class="section-label" style="margin-top:1rem">All Table Filters (flat view)</p>',
+                        unsafe_allow_html=True)
+            flat_rows = [
+                {"Role Name": r["Role Name"],
+                 "Table":     tp["Table"],
+                 "Filter Expression": tp["Filter Expression"],
+                 "Model Permission": r["Model Permission"]}
+                for r in rls_roles
+                for tp in r.get("Table Permissions", [])
+            ]
+            st.dataframe(pd.DataFrame(flat_rows), use_container_width=True, hide_index=True)
+
+
+# ─────────────────────────────────────────────
+# Tab 11 — Export
 # ─────────────────────────────────────────────
 with tab_export:
     st.markdown('<p class="section-label">Export Metadata</p>', unsafe_allow_html=True)
