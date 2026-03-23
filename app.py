@@ -493,6 +493,11 @@ def _empty_result() -> dict:
         "pages": [], "visuals": [],
         "power_query_steps": [],
         "rls_roles": [],
+        "model_metadata": {},
+        "bookmarks": [],
+        "hierarchies": [],
+        "column_metadata": [],
+        "qa_synonyms": [],
         "errors": [], "parse_log": [],
         "report_type": "unknown",
     }
@@ -1716,6 +1721,255 @@ def _parse_tmdl_table(content: str) -> dict:
     return {"name": table_name, "columns": columns, "measures": measures, "partitions": partitions}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Model Info parsers — bookmarks, hierarchies, Q&A synonyms, metadata
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_bookmarks(bookmark_jsons: list, page_id_map: dict,
+                     visual_map: dict = None) -> list:
+    """
+    Parse bookmark.json objects into structured dicts.
+    visual_map: {visual_id -> {"page_id": str, "title": str, "vtype": str}}
+                Built from all visual.json files in the ZIP.
+    Produces "Visuals Affected" as: PageName (Title or type, ...) | PageName2 (...)
+    """
+    from collections import defaultdict
+
+    result = []
+    for obj in bookmark_jsons:
+        display_name = obj.get("displayName", "")
+        options      = obj.get("options", {})
+        exp_state    = obj.get("explorationState", {})
+        page_id      = exp_state.get("activeSection", "")
+        targets      = options.get("targetVisualNames", [])
+        apply_only   = options.get("applyOnlyToTargetVisuals", False)
+
+        # Determine bookmark type
+        if not targets and not apply_only:
+            btype = "Page / Full"
+        elif apply_only and targets:
+            btype = "Visual"
+        else:
+            btype = "Report"
+
+        # Build "PageName (Visual1, Visual2)" string from target visual IDs
+        visuals_affected = "—"
+        if targets and visual_map:
+            page_visuals = defaultdict(list)
+            for vis_id in targets:
+                info = (visual_map or {}).get(vis_id)
+                if info:
+                    name = info.get("title") or info.get("vtype", "visual")
+                    page_visuals[info["page_id"]].append(name)
+            if page_visuals:
+                parts = []
+                for pid, vnames in page_visuals.items():
+                    pname = page_id_map.get(pid, "Hidden page")
+                    # Deduplicate while preserving order
+                    seen, unique = set(), []
+                    for v in vnames:
+                        if v not in seen:
+                            seen.add(v); unique.append(v)
+                    parts.append(f"{pname} ({', '.join(unique)})")
+                visuals_affected = " | ".join(parts)
+            else:
+                visuals_affected = "Targets hidden/deleted page visuals"
+
+        result.append({
+            "Bookmark Name":    display_name,
+            "Type":             btype,
+            "Target Page":      page_id_map.get(page_id, "Hidden/other page" if page_id else "All pages"),
+            "Visuals Affected": visuals_affected,
+        })
+    return result
+
+
+def _parse_hierarchies(tmdl_contents: dict) -> list:
+    """Extract all hierarchies and their levels from TMDL table files."""
+    skip = {"DateTableTemplate", "LocalDateTable"}
+    result = []
+    for fname, content in tmdl_contents.items():
+        if any(sk in fname for sk in skip): continue
+        if "hierarchy" not in content.lower(): continue
+        tname_m = re.match(r"table\s+'?([^'\n\r]+)'?", content)
+        if not tname_m: continue
+        tname = tname_m.group(1).strip("'\"")
+        # Find each hierarchy block
+        for line in content.split('\n'):
+            s = line.strip().rstrip('\r')
+            hm = re.match(r"^hierarchy\s+'?([^'\n\r]+)'?\s*$", s)
+            if hm:
+                current_hier = hm.group(1).strip("'\"")
+                current_levels = []
+                result.append({
+                    "Table":      tname,
+                    "Hierarchy":  current_hier,
+                    "_levels":    current_levels,   # filled below
+                })
+                continue
+            lm = re.match(r"^level\s+'?([^'\n\r]+)'?\s*$", s)
+            if lm and result and result[-1]["Table"] == tname:
+                result[-1]["_levels"].append(lm.group(1).strip("'\""))
+    # Flatten levels into display string
+    for r in result:
+        r["Levels"] = " → ".join(r.pop("_levels"))
+    return result
+
+
+def _parse_column_metadata(tmdl_contents: dict) -> list:
+    """Extract sortByColumn and dataCategory for all columns that have them."""
+    skip = {"DateTableTemplate", "LocalDateTable"}
+    result = []
+    for fname, content in tmdl_contents.items():
+        if any(sk in fname for sk in skip): continue
+        if "sortByColumn" not in content and "dataCategory" not in content: continue
+        tname_m = re.match(r"table\s+'?([^'\n\r]+)'?", content)
+        if not tname_m: continue
+        tname = tname_m.group(1).strip("'\"")
+        col_name = None
+        sort_by = data_cat = None
+        for line in content.split('\n'):
+            s = line.strip().rstrip('\r')
+            cm = re.match(r'^column\s+(.+)$', s)
+            if cm:
+                if col_name and (sort_by or data_cat):
+                    result.append({
+                        "Table":          tname,
+                        "Column":         col_name,
+                        "Sort By Column": sort_by or "—",
+                        "Data Category":  data_cat or "—",
+                    })
+                col_name = cm.group(1).strip("'\"")
+                sort_by = data_cat = None
+                continue
+            if col_name:
+                sb = re.match(r"^sortByColumn:\s*'?([^'\r\n]+)'?\s*$", s)
+                if sb: sort_by = sb.group(1).strip("'\"")
+                dc = re.match(r"^dataCategory:\s*'?([^'\r\n]+)'?\s*$", s)
+                if dc: data_cat = dc.group(1).strip("'\"")
+        if col_name and (sort_by or data_cat):
+            result.append({
+                "Table":          tname,
+                "Column":         col_name,
+                "Sort By Column": sort_by or "—",
+                "Data Category":  data_cat or "—",
+            })
+    return result
+
+
+def _parse_qa_synonyms(culture_tmdl: str) -> list:
+    """Extract Q&A linguistic synonyms from en-US.tmdl."""
+    import json as _json
+    result = []
+    json_match = re.search(r'linguisticMetadata\s*=\s*(\{.*)', culture_tmdl, re.DOTALL)
+    if not json_match: return result
+
+    raw = json_match.group(1).strip()
+    lines = raw.split('\n')
+    cleaned = '\n'.join(l.lstrip('\t') for l in lines)
+
+    # Extract only the balanced JSON object (TMDL may have annotation lines after)
+    depth, end_pos = 0, 0
+    for i, ch in enumerate(cleaned):
+        if ch == '{':   depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                end_pos = i + 1
+                break
+    if not end_pos: return result
+
+    try:
+        meta = _json.loads(cleaned[:end_pos])
+    except Exception:
+        return result
+
+    entities = meta.get("Entities", {})
+    for key, entity in entities.items():
+        binding = (entity.get("Definition", {}) or {}).get("Binding", {}) or {}
+        table   = binding.get("ConceptualEntity", "")
+        prop    = binding.get("ConceptualProperty", "")
+        terms_raw = entity.get("Terms")
+        # Terms can be a list of {name: {...}} dicts or a plain dict
+        term_names = []
+        if isinstance(terms_raw, list):
+            for t in terms_raw:
+                if isinstance(t, dict):
+                    term_names.extend(t.keys())
+        elif isinstance(terms_raw, dict):
+            term_names = list(terms_raw.keys())
+        if table and (term_names or prop):
+            result.append({
+                "Table":    table,
+                "Field":    prop,
+                "Synonyms": ", ".join(term_names) if term_names else "—",
+                "State":    entity.get("State", ""),
+            })
+    return result
+
+
+def _parse_model_metadata(tmdl_contents: dict, platform_jsons: dict,
+                           report_json: dict, version_json: dict,
+                           editor_settings: dict) -> dict:
+    """
+    Collect model-level and report-level metadata into a flat dict.
+    platform_jsons: {"Report": {...}, "SemanticModel": {...}}
+    """
+    meta = {}
+
+    # From database.tmdl
+    db_content = tmdl_contents.get("database.tmdl", "")
+    cl = re.search(r'compatibilityLevel:\s*(\d+)', db_content)
+    meta["Compatibility Level"] = cl.group(1) if cl else "—"
+
+    # From model.tmdl
+    model_content = tmdl_contents.get("model.tmdl", "")
+    culture = re.search(r'^\s*culture:\s*(.+)$', model_content, re.MULTILINE)
+    meta["Model Culture"] = culture.group(1).strip() if culture else "—"
+    dv = re.search(r'defaultPowerBIDataSourceVersion:\s*(.+)', model_content)
+    meta["Default Data Source Version"] = dv.group(1).strip() if dv else "—"
+
+    # Annotations
+    ti = re.search(r'annotation __PBI_TimeIntelligenceEnabled\s*=\s*(\S+)', model_content)
+    meta["Time Intelligence Enabled"] = ("Yes" if ti and ti.group(1).strip() == "1" else "No") if ti else "—"
+    devmode = "DevMode" in model_content
+    meta["Dev Mode (PBIP)"] = "Yes" if devmode else "No"
+    qorder = re.search(r'annotation PBI_QueryOrder\s*=\s*(\[.+?\])', model_content, re.DOTALL)
+    if qorder:
+        try:
+            import json as _j
+            meta["Query Order"] = ", ".join(_j.loads(qorder.group(1)))
+        except Exception:
+            meta["Query Order"] = qorder.group(1).strip()
+
+    # From .platform files
+    for item_type, pdata in platform_jsons.items():
+        pfx = "Report" if item_type == "Report" else "Semantic Model"
+        meta[f"{pfx} Display Name"] = (pdata.get("metadata") or {}).get("displayName", "—")
+        meta[f"{pfx} Logical ID"]   = (pdata.get("config") or {}).get("logicalId", "—")
+        meta[f"{pfx} Platform Version"] = (pdata.get("config") or {}).get("version", "—")
+
+    # From report.json settings
+    if report_json:
+        settings = report_json.get("settings", {})
+        meta["Hide Visual Container Header"] = str(settings.get("hideVisualContainerHeader", "—"))
+        meta["Enhanced Tooltips"]            = str(settings.get("useEnhancedTooltips", "—"))
+        slow = report_json.get("slowDataSourceSettings", {})
+        meta["Cross Highlighting Disabled"]  = str(slow.get("isCrossHighlightingDisabled", "—"))
+
+    # From version.json
+    if version_json:
+        meta["Report Definition Version"] = version_json.get("version", "—")
+
+    # From editorSettings
+    if editor_settings:
+        meta["Show Hidden Fields"]          = str(editor_settings.get("showHiddenFields", "—"))
+        meta["Autodetect Relationships"]    = str(editor_settings.get("autodetectRelationships", "—"))
+        meta["Parallel Query Loading"]      = str(editor_settings.get("parallelQueryLoading", "—"))
+
+    return meta
+
+
 def _parse_tmdl_roles(content: str) -> list:
     """
     Parse a TMDL roles file into structured RLS role dicts.
@@ -2305,12 +2559,401 @@ def to_excel(data: dict) -> bytes:
                    "Table": "", "Filter Expression": ""}
                   for r in data["rls_roles"]]
             pd.DataFrame(flat_rls).to_excel(writer,  sheet_name="RLS",           index=False)
+        if data.get("model_metadata"):
+            meta_rows = [{"Property": k, "Value": str(v)}
+                         for k, v in data["model_metadata"].items() if v and v != "—"]
+            pd.DataFrame(meta_rows).to_excel(writer, sheet_name="Model Metadata", index=False)
+        if data.get("bookmarks"):
+            pd.DataFrame(data["bookmarks"]).to_excel(writer, sheet_name="Bookmarks", index=False)
+        if data.get("hierarchies"):
+            pd.DataFrame(data["hierarchies"]).to_excel(writer, sheet_name="Hierarchies", index=False)
+        if data.get("column_metadata"):
+            cmdf = pd.DataFrame(data["column_metadata"])
+            cmdf = cmdf[(cmdf["Sort By Column"] != "—") | (cmdf["Data Category"] != "—")]
+            cmdf.to_excel(writer, sheet_name="Column Metadata", index=False)
+        if data.get("qa_synonyms"):
+            pd.DataFrame(data["qa_synonyms"]).to_excel(writer, sheet_name="QA Synonyms", index=False)
     return buf.getvalue()
 
 def to_json(data: dict) -> str:
     export = {k: v for k, v in data.items()
               if k in ("tables","columns","measures","relationships","sources","pages","visuals")}
     return json.dumps(export, indent=2)
+
+
+def to_docx(data: dict) -> tuple:
+    """
+    Generate a Word (.docx) metadata report using python-docx.
+    Pure Python — no Node.js required. Works on Windows, Mac, Linux.
+    Returns (bytes, None) on success or (None, error_message) on failure.
+    """
+    try:
+        from docx import Document as _Document
+        from docx.shared import Pt as _Pt, Inches as _Inches, RGBColor as _RGB
+        from docx.enum.text import WD_ALIGN_PARAGRAPH as _ALIGN
+        from docx.enum.table import WD_ALIGN_VERTICAL as _VALIGN
+        from docx.oxml.ns import qn as _qn
+        from docx.oxml import OxmlElement as _OE
+        from datetime import date as _date
+    except ImportError:
+        return None, "python-docx is not installed. Run:  pip install python-docx"
+
+    # ── colours ──────────────────────────────────────────────────────────────
+    GOLD  = "F7C948"; DARK  = "1A1A2E"; BLUE1 = "1F497D"
+    BLUE2 = "2E75B6"; GREY  = "F5F5F5"; WHITE = "FFFFFF"
+
+    def _rgb(h):
+        h = h.lstrip('#')
+        return _RGB(int(h[:2],16), int(h[2:4],16), int(h[4:6],16))
+
+    # ── xml helpers ───────────────────────────────────────────────────────────
+    def _shd_el(fill):
+        shd = _OE('w:shd')
+        shd.set(_qn('w:val'),'clear'); shd.set(_qn('w:color'),'auto')
+        shd.set(_qn('w:fill'), fill); return shd
+
+    def _insert_before(parent, new_el, before_tag):
+        """Insert new_el before the first occurrence of before_tag in parent."""
+        ref = parent.find(_qn(before_tag))
+        if ref is not None:
+            parent.insert(list(parent).index(ref), new_el)
+        else:
+            parent.append(new_el)
+
+    def _set_para_shd(para, fill):
+        pPr = para._p.get_or_add_pPr()
+        _insert_before(pPr, _shd_el(fill), 'w:spacing')
+
+    def _set_cell_shd(cell, fill):
+        cell._tc.get_or_add_tcPr().append(_shd_el(fill))
+
+    def _set_cell_margins(cell, top=40, bottom=40, left=80, right=80):
+        """Schema order inside tcMar: top, start, bottom, end."""
+        tcPr = cell._tc.get_or_add_tcPr()
+        for ex in tcPr.findall(_qn('w:tcMar')): tcPr.remove(ex)
+        tcMar = _OE('w:tcMar')
+        for side, val in [('top',top),('start',left),('bottom',bottom),('end',right)]:
+            n = _OE(f'w:{side}'); n.set(_qn('w:w'),str(val)); n.set(_qn('w:type'),'dxa')
+            tcMar.append(n)
+        tcPr.append(tcMar)
+
+    def _set_table_width(table, w_in):
+        """Insert tblW BEFORE tblLook in tblPr (correct schema order)."""
+        tblPr = table._tbl.find(_qn('w:tblPr'))
+        if tblPr is None:
+            tblPr = _OE('w:tblPr'); table._tbl.insert(0, tblPr)
+        for tw in tblPr.findall(_qn('w:tblW')): tblPr.remove(tw)
+        tblW = _OE('w:tblW')
+        tblW.set(_qn('w:w'), str(int(w_in*1440))); tblW.set(_qn('w:type'),'dxa')
+        _insert_before(tblPr, tblW, 'w:tblLook')
+
+    def _set_col_widths(table, widths):
+        """Place tblGrid AFTER tblPr (correct schema order)."""
+        tbl = table._tbl
+        for g in tbl.findall(_qn('w:tblGrid')): tbl.remove(g)
+        tblGrid = _OE('w:tblGrid')
+        for w in widths:
+            gc = _OE('w:gridCol'); gc.set(_qn('w:w'), str(int(w*1440)))
+            tblGrid.append(gc)
+        tblPr = tbl.find(_qn('w:tblPr'))
+        if tblPr is not None:
+            tbl.insert(list(tbl).index(tblPr)+1, tblGrid)
+        else:
+            tbl.append(tblGrid)
+        for row in table.rows:
+            for i, cell in enumerate(row.cells):
+                if i < len(widths):
+                    tcPr = cell._tc.get_or_add_tcPr()
+                    tcW  = tcPr.find(_qn('w:tcW'))
+                    if tcW is None: tcW = _OE('w:tcW'); tcPr.insert(0, tcW)
+                    tcW.set(_qn('w:w'), str(int(widths[i]*1440)))
+                    tcW.set(_qn('w:type'),'dxa')
+
+    def _rule_para(doc):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = _Pt(4); p.paragraph_format.space_after = _Pt(4)
+        pPr = p._p.get_or_add_pPr()
+        pBdr = _OE('w:pBdr'); bot = _OE('w:bottom')
+        bot.set(_qn('w:val'),'single'); bot.set(_qn('w:sz'),'4')
+        bot.set(_qn('w:space'),'1');   bot.set(_qn('w:color'),'AAAAAA')
+        pBdr.append(bot)
+        _insert_before(pPr, pBdr, 'w:spacing')
+
+    def _fix_zoom(docx_bytes):
+        """Add required w:percent to w:zoom in settings.xml."""
+        import zipfile, re, io as _io
+        with zipfile.ZipFile(_io.BytesIO(docx_bytes),'r') as zin:
+            out = _io.BytesIO()
+            with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    d = zin.read(item.filename)
+                    if item.filename == 'word/settings.xml':
+                        s = d.decode('utf-8')
+                        s = re.sub(r'(<w:zoom\b)(?![^/]*w:percent)',
+                                   r'\1 w:percent="100"', s)
+                        d = s.encode('utf-8')
+                    zout.writestr(item, d)
+        return out.getvalue()
+
+    # ── content helpers ───────────────────────────────────────────────────────
+    def h1(doc, text):
+        p = doc.add_heading(level=1)
+        run = p.runs[0] if p.runs else p.add_run()
+        run.text = text; run.font.color.rgb = _rgb(DARK)
+        run.font.name = 'Arial'; run.font.size = _Pt(18)
+        p.paragraph_format.space_before = _Pt(18)
+        p.paragraph_format.space_after  = _Pt(6)
+
+    def h2(doc, text):
+        p = doc.add_heading(level=2)
+        run = p.runs[0] if p.runs else p.add_run()
+        run.text = text; run.font.color.rgb = _rgb(BLUE1)
+        run.font.name = 'Arial'; run.font.size = _Pt(14)
+        p.paragraph_format.space_before = _Pt(12)
+        p.paragraph_format.space_after  = _Pt(4)
+
+    def h3(doc, text):
+        p = doc.add_heading(level=3)
+        run = p.runs[0] if p.runs else p.add_run()
+        run.text = text; run.font.color.rgb = _rgb(BLUE2)
+        run.font.name = 'Arial'; run.font.size = _Pt(11)
+        p.paragraph_format.space_before = _Pt(8)
+        p.paragraph_format.space_after  = _Pt(2)
+
+    def highlighted(doc, text):
+        """Gold-background paragraph — shd inserted before w:spacing in pPr."""
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = _Pt(10)
+        p.paragraph_format.space_after  = _Pt(4)
+        _set_para_shd(p, GOLD)
+        run = p.add_run(text); run.bold = True
+        run.font.size = _Pt(12); run.font.color.rgb = _rgb(DARK)
+        run.font.name = 'Arial'
+
+    def kv(doc, key, value):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = _Pt(1)
+        p.paragraph_format.space_after  = _Pt(1)
+        r1 = p.add_run(f"{key}: "); r1.bold = True
+        r1.font.name = 'Arial'; r1.font.size = _Pt(9.5)
+        r1.font.color.rgb = _rgb(BLUE1)
+        r2 = p.add_run(str(value) if value else "—")
+        r2.font.name = 'Arial'; r2.font.size = _Pt(9.5)
+
+    def body(doc, text, bold=False, italic=False):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = _Pt(2)
+        p.paragraph_format.space_after  = _Pt(2)
+        run = p.add_run(str(text) if text else "")
+        run.bold = bold; run.italic = italic
+        run.font.name = 'Arial'; run.font.size = _Pt(9.5)
+
+    def make_table(doc, headers, col_widths, rows):
+        if not rows: return
+        table = doc.add_table(rows=1, cols=len(headers))
+        table.style = 'Table Grid'
+        _set_table_width(table, sum(col_widths))
+        for cell, txt in zip(table.rows[0].cells, headers):
+            _set_cell_shd(cell, DARK); _set_cell_margins(cell)
+            cell.vertical_alignment = _VALIGN.CENTER
+            run = cell.paragraphs[0].add_run(txt)
+            run.bold = True; run.font.color.rgb = _RGB(255,255,255)
+            run.font.size = _Pt(8.5); run.font.name = 'Arial'
+        for ri, vals in enumerate(rows):
+            row = table.add_row()
+            fill = GREY if ri % 2 == 1 else WHITE
+            for cell, val in zip(row.cells, vals):
+                _set_cell_shd(cell, fill); _set_cell_margins(cell)
+                cell.vertical_alignment = _VALIGN.TOP
+                run = cell.paragraphs[0].add_run(str(val) if val else "—")
+                run.font.size = _Pt(8); run.font.name = 'Arial'
+        _set_col_widths(table, col_widths)
+        doc.add_paragraph()
+
+    # ── Build document ────────────────────────────────────────────────────────
+    doc = _Document()
+    sec = doc.sections[0]
+    sec.page_width    = _Inches(8.5); sec.page_height   = _Inches(11)
+    sec.top_margin    = _Inches(0.9); sec.bottom_margin  = _Inches(0.9)
+    sec.left_margin   = _Inches(0.85);sec.right_margin   = _Inches(0.85)
+    doc.styles['Normal'].font.name = 'Arial'
+    doc.styles['Normal'].font.size = _Pt(9.5)
+    CW = 6.8  # content width in inches
+
+    # Cover
+    rn = (data.get("model_metadata") or {}).get("Report Display Name", "Power BI Report")
+    for _ in range(3): doc.add_paragraph()
+    tp = doc.add_paragraph(); tp.alignment = _ALIGN.CENTER
+    r = tp.add_run(rn); r.font.size = _Pt(28); r.bold = True
+    r.font.color.rgb = _rgb(DARK); r.font.name = 'Arial'
+    sp = doc.add_paragraph(); sp.alignment = _ALIGN.CENTER
+    r2 = sp.add_run("Metadata Report"); r2.font.size = _Pt(18); r2.font.name = 'Arial'
+    r2.font.color.rgb = _rgb("555555")
+    dp = doc.add_paragraph(); dp.alignment = _ALIGN.CENTER
+    dp.paragraph_format.space_before = _Pt(10)
+    r3 = dp.add_run(f"Generated: {_date.today().strftime('%B %d, %Y')}")
+    r3.font.size = _Pt(10); r3.font.name = 'Arial'; r3.font.color.rgb = _rgb("888888")
+    doc.add_page_break()
+
+    # 1. Model Metadata
+    h1(doc, "1. Model & Report Metadata"); _rule_para(doc)
+    meta = data.get("model_metadata") or {}
+    rows = [[k, str(v)] for k,v in meta.items() if v and v != "—"]
+    if rows: make_table(doc, ["Property","Value"], [2.5, CW-2.5], rows)
+    else:    body(doc, "No metadata available.", italic=True)
+    doc.add_page_break()
+
+    # 2. Tables
+    h1(doc, "2. Tables"); _rule_para(doc)
+    for tbl in (data.get("tables") or []):
+        tname = tbl.get("Table Name","")
+        h2(doc, tname)
+        kv(doc,"Source",tbl.get("Source","—")); kv(doc,"Type",tbl.get("Type","—"))
+        kv(doc,"Is Hidden",tbl.get("Is Hidden","—"))
+        if tbl.get("Description"): kv(doc,"Description",tbl["Description"])
+        cols = [c for c in (data.get("columns") or []) if c.get("Table")==tname]
+        if cols:
+            h3(doc,"Columns")
+            make_table(doc,["Column","Data Type","Calculated","Expression","Format","Hidden"],
+                       [1.5,1.0,0.85,1.65,0.95,0.85],
+                       [[c.get("Column Name",""),c.get("Data Type",""),c.get("Is Calculated",""),
+                         c.get("Expression","—") or "—",c.get("Format String","—") or "—",
+                         c.get("Is Hidden","")] for c in cols])
+        cm = [c for c in (data.get("column_metadata") or [])
+              if c.get("Table")==tname
+              and (c.get("Sort By Column","—")!="—" or c.get("Data Category","—")!="—")]
+        if cm:
+            h3(doc,"Column Metadata")
+            make_table(doc,["Column","Sort By Column","Data Category"],
+                       [CW/3, CW/3, CW/3],
+                       [[c.get("Column",""),c.get("Sort By Column","—"),
+                         c.get("Data Category","—")] for c in cm])
+        measures = [m for m in (data.get("measures") or []) if m.get("Table")==tname]
+        if measures:
+            h3(doc,"Measures")
+            for m in measures:
+                p = doc.add_paragraph(); p.paragraph_format.space_before = _Pt(6)
+                r = p.add_run(m.get("Measure Name","")); r.bold = True
+                r.font.size = _Pt(10); r.font.color.rgb = _rgb(BLUE2); r.font.name = 'Arial'
+                kv(doc,"DAX",m.get("DAX Formula",""))
+                if m.get("Format String"): kv(doc,"Format",m["Format String"])
+                kv(doc,"Tables Used",m.get("Tables Used","—"))
+                kv(doc,"Columns Used",m.get("Columns Used","—"))
+                kv(doc,"Measures Used",m.get("Measures Used","—"))
+                kv(doc,"Hidden",m.get("Is Hidden",""))
+        pqs = [s for s in (data.get("power_query_steps") or []) if s.get("Table")==tname]
+        if pqs:
+            h3(doc,"Power Query Steps")
+            make_table(doc,["#","Step Name","Description"],[0.35,1.5,CW-1.85],
+                       [[str(s.get("Step Order","")),s.get("Step Name",""),
+                         s.get("Step Description","")] for s in pqs])
+        _rule_para(doc)
+    doc.add_page_break()
+
+    # 3. Relationships
+    h1(doc,"3. Relationships"); _rule_para(doc)
+    rels = data.get("relationships") or []
+    if rels:
+        make_table(doc,
+            ["From Table","From Col","→","To Table","To Col","Type","Cross Filter","Active"],
+            [1.0,1.0,0.2,1.0,1.0,0.95,0.95,0.6],
+            [[r.get("From Table",""),r.get("From Column",""),"→",r.get("To Table",""),
+              r.get("To Column",""),r.get("Relationship Type",""),
+              r.get("Cross Filter",""),r.get("Active","")] for r in rels])
+    else: body(doc,"No relationships defined.",italic=True)
+    doc.add_page_break()
+
+    # 4. Data Sources
+    h1(doc,"4. Data Sources"); _rule_para(doc)
+    sources = data.get("sources") or []
+    if sources:
+        make_table(doc,["Source Type","Server","Database","Query"],
+                   [1.2,1.5,1.5,CW-4.2],
+                   [[s.get("Source Type",""),s.get("Server","—") or "—",
+                     s.get("Database","—") or "—",s.get("Query","—") or "—"] for s in sources])
+    else: body(doc,"No data sources found.",italic=True)
+    doc.add_page_break()
+
+    # 5. Visuals by page
+    h1(doc,"5. Report Visuals"); _rule_para(doc)
+    visuals = data.get("visuals") or []
+    all_pages = list(dict.fromkeys(v.get("Page","") for v in visuals))
+    apf = data.get("_all_pages_filter","")
+    pfm = data.get("_page_filter_map") or {}
+    if apf: body(doc, f"All-pages filter: {apf}", bold=True)
+    for pg in all_pages:
+        highlighted(doc, pg)
+        pf = pfm.get(pg,"")
+        if pf: kv(doc,"Page Filters",pf)
+        pv = [v for v in visuals if v.get("Page")==pg]
+        make_table(doc,
+            ["Visual Title","Type","Visual Filters","Tables","Measures Used","Columns Used"],
+            [1.4,0.85,1.4,0.7,1.4,1.25],
+            [[v.get("Visual Title","—") or "—",v.get("Visual Type","—"),
+              v.get("Visual Filters","—") or "—",v.get("Tables Used","—") or "—",
+              v.get("Measures Used","—") or "—",v.get("Columns Used","—") or "—"] for v in pv])
+        _rule_para(doc)
+    doc.add_page_break()
+
+    # 6. RLS
+    h1(doc,"6. Row-Level Security (RLS)"); _rule_para(doc)
+    rls = data.get("rls_roles") or []
+    if rls:
+        for role in rls:
+            h2(doc, role.get("Role Name",""))
+            kv(doc,"Model Permission",role.get("Model Permission",""))
+            members = role.get("Members") or []
+            if members: kv(doc,"Members",", ".join(members))
+            tp = role.get("Table Permissions") or []
+            if tp:
+                h3(doc,"Table Filters")
+                make_table(doc,["Table","Filter Expression"],[1.8,CW-1.8],
+                           [[t.get("Table",""),t.get("Filter Expression","")] for t in tp])
+            else: body(doc,"No table-level filters.",italic=True)
+            _rule_para(doc)
+    else: body(doc,"No RLS Configured",bold=True)
+    doc.add_page_break()
+
+    # 7. Bookmarks
+    h1(doc,"7. Bookmarks"); _rule_para(doc)
+    bms = data.get("bookmarks") or []
+    if bms:
+        make_table(doc,["Bookmark Name","Type","Target Page","Visuals Affected"],
+                   [1.5,0.9,1.3,CW-3.7],
+                   [[b.get("Bookmark Name",""),b.get("Type",""),b.get("Target Page",""),
+                     b.get("Visuals Affected","—") or "—"] for b in bms])
+    else: body(doc,"No bookmarks defined.",italic=True)
+    doc.add_page_break()
+
+    # 8. Hierarchies
+    h1(doc,"8. Hierarchies"); _rule_para(doc)
+    hiers = data.get("hierarchies") or []
+    if hiers:
+        make_table(doc,["Table","Hierarchy","Levels"],[1.5,1.8,CW-3.3],
+                   [[h.get("Table",""),h.get("Hierarchy",""),h.get("Levels","")] for h in hiers])
+    else: body(doc,"No hierarchies defined.",italic=True)
+    doc.add_page_break()
+
+    # 9. Q&A Synonyms
+    h1(doc,"9. Q&A Synonyms"); _rule_para(doc)
+    qa = data.get("qa_synonyms") or []
+    if qa:
+        make_table(doc,["Table","Field","Synonyms","State"],[1.2,1.7,3.0,CW-5.9],
+                   [[q.get("Table",""),q.get("Field",""),q.get("Synonyms",""),
+                     q.get("State","")] for q in qa])
+    else: body(doc,"No Q&A synonyms defined.",italic=True)
+
+    # Save and post-fix zoom attribute
+    try:
+        buf = io.BytesIO()
+        doc.save(buf)
+        return _fix_zoom(buf.getvalue()), None
+    except Exception as _e:
+        return None, f"Failed to save document: {_e}"
+
+
+
+
 
 def _df(lst):
     return pd.DataFrame(lst) if lst else pd.DataFrame()
@@ -2423,6 +3066,12 @@ def classify_and_load(files) -> tuple:
     pbix_bytes    = None
     visual_jsons  = []
     page_jsons    = []
+    # Extra model-info collections
+    bookmark_jsons   = []
+    platform_jsons   = {}   # {"Report": {...}, "SemanticModel": {...}}
+    version_json     = {}
+    editor_settings  = {}
+    culture_tmdl     = ""
 
     for f in files:
         fname  = f.name
@@ -2461,6 +3110,9 @@ def classify_and_load(files) -> tuple:
 
                         if zext == ".tmdl":
                             tmdl_contents[zbase] = zbytes.decode("utf-8","replace")
+                            # Capture culture file for Q&A synonyms
+                            if "cultures/" in zname.lower() and "en-us" in zbase.lower():
+                                culture_tmdl = zbytes.decode("utf-8","replace")
 
                         elif zext == ".bim" and bim_bytes is None:
                             bim_bytes = zbytes
@@ -2480,6 +3132,28 @@ def classify_and_load(files) -> tuple:
                                         pi = parts.index("pages")
                                         obj["_page_id"] = parts[pi+1] if pi+1 < len(parts) else ""
                                     visual_jsons.append(obj)
+                                    # Also build visual_map entry: vis_id -> title, vtype, page_id
+                                    if "visuals" in parts:
+                                        vis_idx = parts.index("visuals")
+                                        vis_id  = parts[vis_idx+1] if vis_idx+1 < len(parts) else ""
+                                        if vis_id:
+                                            vis = obj.get("visual", {})
+                                            vtype = vis.get("visualType", "visual")
+                                            # Extract title
+                                            v_title = ""
+                                            for cont in [vis.get("visualContainerObjects",{}),
+                                                         vis.get("objects",{})]:
+                                                entries = cont.get("title",[])
+                                                if not entries: continue
+                                                props = (entries[0].get("properties",{})
+                                                         if isinstance(entries,list) else {})
+                                                t = (props.get("text",{}).get("expr",{})
+                                                          .get("Literal",{}).get("Value",""))
+                                                if t and t.strip("'\""): v_title = t.strip("'\""); break
+                                            bookmark_jsons.append({"_vis_map_entry": {
+                                                vis_id: {"page_id": obj.get("_page_id",""),
+                                                         "title": v_title, "vtype": vtype}
+                                            }})
 
                                 elif zbase in ("page.json","pages.json") \
                                    or "page" in zbase.lower():
@@ -2489,15 +3163,43 @@ def classify_and_load(files) -> tuple:
                                          ("model","tables","compatibilityLevel","create","createOrReplace")):
                                     bim_bytes = zbytes
 
+                                # Bookmarks
+                                elif zbase.endswith(".bookmark.json") or "bookmarks/" in zpath_lower:
+                                    if "displayName" in obj:
+                                        bookmark_jsons.append(obj)
+
+                                # version.json
+                                elif zbase == "version.json":
+                                    version_json = obj
+
+                                # editorSettings.json
+                                elif zbase == "editorsettings.json" or "editorsettings" in zbase.lower():
+                                    editor_settings = obj
+
                             except Exception:
                                 pass
+
+                        # .platform files (JSON without .json extension)
+                        elif zbase == ".platform":
+                            try:
+                                pobj = json.loads(zbytes.decode("utf-8","replace"))
+                                ptype = (pobj.get("metadata") or {}).get("type", "")
+                                if ptype in ("Report", "SemanticModel"):
+                                    platform_jsons[ptype] = pobj
+                            except: pass
 
                     # Store the page_id_map and filter data for extract_from_classified
                     if _page_id_map and not hasattr(_page_id_map, '_injected'):
                         page_jsons.append({
-                            "_page_id_map":  _page_id_map,
-                            "_page_filters": _page_filters,
-                            "_report_json":  _report_json,
+                            "_page_id_map":    _page_id_map,
+                            "_page_filters":   _page_filters,
+                            "_report_json":    _report_json,
+                            "_bookmark_jsons": bookmark_jsons,
+                            "_platform_jsons": platform_jsons,
+                            "_version_json":   version_json,
+                            "_editor_settings":editor_settings,
+                            "_culture_tmdl":   culture_tmdl,
+                            "_page_full_objs": list(_page_filters.values()),
                         })
 
             except Exception:
@@ -2543,6 +3245,8 @@ def extract_from_classified(tmdl_contents, bim_bytes, pbix_bytes, visual_jsons, 
         sem_data["report_type"] = "Desktop"
         sem_data["parse_log"].append(f"TMDL: {len(tmdl_contents)} files — {', '.join(sorted(tmdl_contents.keys()))}")
         _parse_tmsl({"model": model}, sem_data)
+        sem_data["hierarchies"]     = _parse_hierarchies(tmdl_contents)
+        sem_data["column_metadata"] = _parse_column_metadata(tmdl_contents)
         sem_data = _finalise(sem_data)
         sem_data["_source"] = "SemanticModel (TMDL)"
 
@@ -2565,15 +3269,25 @@ def extract_from_classified(tmdl_contents, bim_bytes, pbix_bytes, visual_jsons, 
     # ── Report extraction ─────────────────────────────────────────────────────
     if visual_jsons:
         # Extract page_id_map and filter data injected during ZIP parsing
-        page_id_map   = {}
-        page_filters  = {}   # displayName -> page.json obj (for filters)
-        report_json   = {}   # report.json (for all-pages filters)
-        real_page_jsons = []
+        page_id_map    = {}
+        page_filters   = {}
+        report_json    = {}
+        bookmark_jsons = []
+        platform_jsons = {}
+        version_json   = {}
+        editor_settings= {}
+        culture_tmdl   = ""
+        real_page_jsons= []
         for pj in page_jsons:
             if "_page_id_map" in pj:
                 page_id_map.update(pj["_page_id_map"])
                 page_filters.update(pj.get("_page_filters", {}))
-                report_json = pj.get("_report_json", {})
+                report_json    = pj.get("_report_json", {})
+                bookmark_jsons = pj.get("_bookmark_jsons", [])
+                platform_jsons = pj.get("_platform_jsons", {})
+                version_json   = pj.get("_version_json", {})
+                editor_settings= pj.get("_editor_settings", {})
+                culture_tmdl   = pj.get("_culture_tmdl", "")
             else:
                 real_page_jsons.append(pj)
 
@@ -2589,6 +3303,24 @@ def extract_from_classified(tmdl_contents, bim_bytes, pbix_bytes, visual_jsons, 
         )
         rep_data["_all_pages_filter"] = all_pages_filter
         rep_data["_page_filter_map"]  = page_filter_map
+
+        # Populate model-info fields
+        # Separate real bookmarks from visual_map entries injected during scan
+        real_bookmark_jsons = []
+        visual_map = {}
+        for bj in bookmark_jsons:
+            if "_vis_map_entry" in bj:
+                visual_map.update(bj["_vis_map_entry"])
+            else:
+                real_bookmark_jsons.append(bj)
+
+        rep_data["bookmarks"]      = _parse_bookmarks(real_bookmark_jsons, page_id_map, visual_map)
+        rep_data["model_metadata"] = _parse_model_metadata(
+            tmdl_contents, platform_jsons, report_json, version_json, editor_settings
+        )
+        if culture_tmdl:
+            rep_data["qa_synonyms"] = _parse_qa_synonyms(culture_tmdl)
+
         rep_data = _finalise(rep_data)
 
     elif pbix_bytes and not sem_data:
@@ -2617,6 +3349,11 @@ def merge_results(sem, rep):
         merged["_page_filter_map"]  = rep.get("_page_filter_map",  {})
         merged["power_query_steps"] = sem.get("power_query_steps", []) or rep.get("power_query_steps", [])
         merged["rls_roles"]         = sem.get("rls_roles", [])         or rep.get("rls_roles", [])
+        merged["model_metadata"]    = {**sem.get("model_metadata", {}), **rep.get("model_metadata", {})}
+        merged["bookmarks"]         = rep.get("bookmarks",      [])
+        merged["hierarchies"]       = sem.get("hierarchies",    []) or rep.get("hierarchies", [])
+        merged["column_metadata"]   = sem.get("column_metadata",[]) or rep.get("column_metadata", [])
+        merged["qa_synonyms"]       = rep.get("qa_synonyms",    []) or sem.get("qa_synonyms", [])
         return merged
     result = sem or rep or {}
     if rep and not sem:
@@ -2791,10 +3528,10 @@ st.markdown(f"""
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 (tab_overview, tab_tables, tab_columns, tab_measures,
- tab_deps, tab_rels, tab_sources, tab_visuals, tab_pq, tab_rls, tab_export) = st.tabs([
+ tab_deps, tab_rels, tab_sources, tab_visuals, tab_pq, tab_rls, tab_model_info, tab_export) = st.tabs([
     "📊 Overview", "🗂 Tables", "🔢 Columns", "📐 Measures",
     "🔍 Dependencies", "🔗 Relationships", "🔌 Data Sources", "🖼 Visuals",
-    "⚡ Power Query", "🔐 RLS", "⬇️ Export",
+    "⚡ Power Query", "🔐 RLS", "📋 Model Info", "⬇️ Export",
 ])
 
 
@@ -3212,26 +3949,172 @@ with tab_rls:
 
 
 # ─────────────────────────────────────────────
-# Tab 11 — Export
+# Tab 11 — Model Info
+# ─────────────────────────────────────────────
+with tab_model_info:
+    st.markdown('<p class="section-label">Model Info</p>', unsafe_allow_html=True)
+
+    any_data = any([
+        data.get("model_metadata"),
+        data.get("bookmarks"),
+        data.get("hierarchies"),
+        data.get("column_metadata"),
+        data.get("qa_synonyms"),
+    ])
+    if not any_data:
+        st.markdown(
+            '<div class="empty-state"><span class="empty-icon">📋</span>'
+            'No model info found. Upload a full PBIP project ZIP.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        # ── 1. Model & Report Metadata ─────────────────────────────────────────
+        meta = data.get("model_metadata", {})
+        if meta:
+            st.markdown('<p class="section-label">Model & Report Metadata</p>', unsafe_allow_html=True)
+            meta_rows = [{"Property": k, "Value": str(v)} for k, v in meta.items() if v and v != "—"]
+            st.dataframe(pd.DataFrame(meta_rows), use_container_width=True, hide_index=True)
+
+        # ── 2. Bookmarks ────────────────────────────────────────────────────────
+        bookmarks = data.get("bookmarks", [])
+        st.markdown(
+            f'<p class="section-label" style="margin-top:1.5rem">Bookmarks'
+            f'<span style="font-size:0.72rem;font-weight:400;color:var(--text-muted);'
+            f'margin-left:0.5rem">({len(bookmarks)})</span></p>',
+            unsafe_allow_html=True,
+        )
+        if bookmarks:
+            bdf = pd.DataFrame(bookmarks)
+            # Filter by type
+            btypes = ["All"] + sorted(bdf["Type"].unique().tolist())
+            btype_filter = st.selectbox("Filter by type", btypes, key="bookmark_type_filter")
+            if btype_filter != "All":
+                bdf = bdf[bdf["Type"] == btype_filter]
+            show_b = [c for c in ["Bookmark Name","Type","Target Page","Visuals Affected"] if c in bdf.columns]
+            st.dataframe(bdf[show_b], use_container_width=True, hide_index=True)
+        else:
+            st.markdown(
+                '<div style="font-family:var(--mono);font-size:0.72rem;color:var(--text-muted);'
+                'padding:0.5rem 0">No bookmarks defined.</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── 3. Hierarchies ──────────────────────────────────────────────────────
+        hierarchies = data.get("hierarchies", [])
+        st.markdown(
+            f'<p class="section-label" style="margin-top:1.5rem">Hierarchies'
+            f'<span style="font-size:0.72rem;font-weight:400;color:var(--text-muted);'
+            f'margin-left:0.5rem">({len(hierarchies)})</span></p>',
+            unsafe_allow_html=True,
+        )
+        if hierarchies:
+            st.dataframe(pd.DataFrame(hierarchies), use_container_width=True, hide_index=True)
+        else:
+            st.markdown(
+                '<div style="font-family:var(--mono);font-size:0.72rem;color:var(--text-muted);'
+                'padding:0.5rem 0">No hierarchies defined.</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── 4. Column Metadata ──────────────────────────────────────────────────
+        col_meta = data.get("column_metadata", [])
+        st.markdown(
+            f'<p class="section-label" style="margin-top:1.5rem">Column Metadata'
+            f'<span style="font-size:0.72rem;font-weight:400;color:var(--text-muted);'
+            f'margin-left:0.5rem">(sortByColumn & dataCategory)</span></p>',
+            unsafe_allow_html=True,
+        )
+        if col_meta:
+            cmdf = pd.DataFrame(col_meta)
+            # Filter to only rows that have non-"—" values
+            cmdf_filtered = cmdf[(cmdf["Sort By Column"] != "—") | (cmdf["Data Category"] != "—")]
+            cm_tables = ["All"] + sorted(cmdf_filtered["Table"].unique().tolist())
+            cm_filter  = st.selectbox("Filter by table", cm_tables, key="col_meta_table_filter")
+            if cm_filter != "All":
+                cmdf_filtered = cmdf_filtered[cmdf_filtered["Table"] == cm_filter]
+            st.dataframe(cmdf_filtered, use_container_width=True, hide_index=True)
+        else:
+            st.markdown(
+                '<div style="font-family:var(--mono);font-size:0.72rem;color:var(--text-muted);'
+                'padding:0.5rem 0">No column metadata found.</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── 5. Q&A Synonyms ─────────────────────────────────────────────────────
+        qa = data.get("qa_synonyms", [])
+        st.markdown(
+            f'<p class="section-label" style="margin-top:1.5rem">Q&A Synonyms'
+            f'<span style="font-size:0.72rem;font-weight:400;color:var(--text-muted);'
+            f'margin-left:0.5rem">({len(qa)} entries)</span></p>',
+            unsafe_allow_html=True,
+        )
+        if qa:
+            st.dataframe(pd.DataFrame(qa), use_container_width=True, hide_index=True)
+        else:
+            st.markdown(
+                '<div style="font-family:var(--mono);font-size:0.72rem;color:var(--text-muted);'
+                'padding:0.5rem 0">No Q&amp;A synonyms defined.</div>',
+                unsafe_allow_html=True,
+            )
+
+
+# ─────────────────────────────────────────────
+# Tab 12 — Export
 # ─────────────────────────────────────────────
 with tab_export:
     st.markdown('<p class="section-label">Export Metadata</p>', unsafe_allow_html=True)
-    e1, e2, e3 = st.columns(3)
     stem = "metadata"
+    e1, e2 = st.columns(2)
 
     with e1:
         st.markdown("#### 📊 Excel Workbook")
-        st.markdown('<span style="font-family:var(--mono);font-size:0.72rem;color:var(--text-muted)">All sheets: Tables, Columns, Measures, Relationships, Sources, Visuals</span>', unsafe_allow_html=True)
-        st.download_button("Download .xlsx", data=to_excel(data), file_name=f"{stem}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        sheet_list = "Tables, Columns, Measures, Relationships, Data Sources, Visuals"
+        if data.get("power_query_steps"): sheet_list += ", Power Query"
+        if data.get("rls_roles"):         sheet_list += ", RLS"
+        if data.get("model_metadata"):    sheet_list += ", Model Metadata"
+        if data.get("bookmarks"):         sheet_list += ", Bookmarks"
+        if data.get("hierarchies"):       sheet_list += ", Hierarchies"
+        if data.get("column_metadata"):   sheet_list += ", Column Metadata"
+        if data.get("qa_synonyms"):       sheet_list += ", QA Synonyms"
+        st.markdown(
+            f'<span style="font-family:var(--mono);font-size:0.72rem;color:var(--text-muted)">'
+            f'Sheets: {sheet_list}</span>',
+            unsafe_allow_html=True,
+        )
+        st.download_button(
+            "Download .xlsx",
+            data=to_excel(data),
+            file_name=f"{stem}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     with e2:
-        for key, label in [("tables","Tables"),("measures","Measures"),("columns","Columns")]:
-            st.markdown(f"#### 📄 {label} CSV")
-            st.download_button(f"Download {label.lower()}.csv", data=_df(data[key]).to_csv(index=False), file_name=f"{stem}_{key}.csv", mime="text/csv", key=f"dl_{key}")
-
-    with e3:
-        st.markdown("#### 🔣 JSON")
-        st.download_button("Download .json", data=to_json(data), file_name=f"{stem}.json", mime="application/json")
+        st.markdown("#### 📝 Word Document")
+        st.markdown(
+            '<span style="font-family:var(--mono);font-size:0.72rem;color:var(--text-muted)">'
+            'Full report: all sections, page names highlighted, tables per section</span>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Generate .docx", key="gen_docx_btn"):
+            with st.spinner("Building Word document…"):
+                try:
+                    docx_bytes, docx_err = to_docx(data)
+                except Exception as _ex:
+                    docx_bytes, docx_err = None, str(_ex)
+            if docx_bytes:
+                st.download_button(
+                    "Download .docx",
+                    data=docx_bytes,
+                    file_name=f"{stem}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="dl_docx",
+                )
+            else:
+                st.error(
+                    f"Word document generation failed.\n\n"
+                    f"**Reason:** {docx_err or 'Unknown error'}\n\n"
+                    f"Install python-docx with:  `pip install python-docx`"
+                )
 
     st.markdown("---")
     st.markdown('<p class="section-label">Preview</p>', unsafe_allow_html=True)
